@@ -23,6 +23,7 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
 import time
@@ -31,6 +32,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import urlencode, urlsplit
+
+# Detailliertes Logging, damit Endlosschleifen und API-Antworten nachvollziehbar
+# sind. Die Ausgaben sind bewusst nicht abschaltbar, da sie der Fehlersuche dienen.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("abrechnung")
 
 try:  # ``requests`` ist optional; ohne Live-Credentials nutzt der Client urllib.
     import requests  # type: ignore
@@ -164,8 +173,13 @@ class SmoobuClient:
         headers.update(self._sign(method, path_only, query, body_bytes))
 
         url = self.config.base_url + path_only + (f"?{query}" if query else "")
+        log.info("HTTP %s %s (body=%d bytes)", method.upper(), url, len(body_bytes))
         response = self._http(method, url, headers, body_bytes)
-        return self._handle(response)
+        log.info(
+            "Antwort %s %s -> status=%d, %d bytes",
+            method.upper(), url, response.status_code, len(response.text or ""),
+        )
+        return self._handle(response, path_only)
 
     def _http(self, method: str, url: str, headers: dict[str, str], body: bytes) -> "Response":
         if requests is not None:
@@ -182,15 +196,42 @@ class SmoobuClient:
             return Response(e.code, e.read().decode("utf-8", "replace"), dict(e.headers))
 
     @staticmethod
-    def _handle(response: "Response") -> Any:
+    def _handle(response: "Response", path: str = "") -> Any:
+        # 404 auf /api/booking/{id}/price-elements ist ein erwarteter Fall:
+        # nicht jede Buchung hat Preiselemente. Daher nur INFO statt WARNING;
+        # get_price_elements faengt die Ausnahme ab und liefert [].
+        expected_404 = path.endswith("/price-elements") and response.status_code == 404
         if response.status_code == 429:
             retry = response.headers.get("X-RateLimit-Retry-After")
+            log.warning("Smoobu Rate-Limit (429). Retry-After=%s", retry)
             raise SmoobuError(
                 f"Rate-Limit überschritten (429). Retry-After: {retry}",
                 status_code=429,
                 body=response.text,
             )
         if response.status_code >= 400:
+            snippet = response.text[:500]
+            # Smoobu liefert bei Fehlern (z. B. 404) oft eine HTML-Seite statt JSON.
+            # Diese nicht als Text ins Log schreiben, sondern nur grob kennzeichnen.
+            stripped = snippet.lstrip().lower()
+            is_html = stripped.startswith("<!doctype") or stripped.startswith("<html")
+            if expected_404:
+                if is_html:
+                    log.info(
+                        "price-elements: 404 fuer %s, HTML-Antwort (%d bytes) - erwartet, "
+                        "keine Preiselemente.",
+                        path, len(response.text or ""),
+                    )
+                else:
+                    log.info("price-elements: 404 fuer %s - erwartet, keine Preiselemente.", path)
+            else:
+                if is_html:
+                    log.warning(
+                        "Smoobu-API-Fehler %d: HTML-Antwort (%d bytes) statt JSON.",
+                        response.status_code, len(response.text or ""),
+                    )
+                else:
+                    log.warning("Smoobu-API-Fehler %d: %s", response.status_code, snippet)
             raise SmoobuError(
                 f"Smoobu-API-Fehler {response.status_code}: {response.text[:500]}",
                 status_code=response.status_code,
@@ -218,14 +259,30 @@ class SmoobuClient:
         return [a for a in apartments if isinstance(a, dict)]
 
     def get_reservations(self, from_date: str, to_date: str) -> list[dict[str, Any]]:
-        """Liefert alle Reservierungen im Zeitraum ``from_date``..``to_date``."""
+        """Liefert alle Reservierungen im Zeitraum ``from_date``..``to_date``.
+
+        Paginierung mit mehreren Sicherheitsnetzen gegen Endlosschleifen:
+
+        - Abbruch, sobald eine Seite keine *neuen* Buchungen mehr liefert
+          (die API wiederholt dieselbe Seite => sonst Endlosschleife).
+        - Abbruch bei ``len(bookings) < requested_page_size`` (letzte Seite).
+        - Abbruch, sobald ``total`` erreicht ist (falls gemeldet).
+        - harte Begrenzung auf ``MAX_PAGES`` Seiten.
+        """
+        requested_page_size = 100
+        max_pages = 1000  # Sicherheitsbremse
         results: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
         page = 1
-        while True:
+        log.info(
+            "get_reservations: von=%s bis=%s, pageSize=%d, maxPages=%d",
+            from_date, to_date, requested_page_size, max_pages,
+        )
+        while page <= max_pages:
             data = self.request(
                 "GET",
                 "/api/reservations",
-                params={"from": from_date, "to": to_date, "page": page, "pageSize": 100},
+                params={"from": from_date, "to": to_date, "page": page, "pageSize": requested_page_size},
             )
             body = data.get("body", data) if isinstance(data, dict) else data
             bookings = []
@@ -239,15 +296,55 @@ class SmoobuClient:
             elif isinstance(body, list):
                 bookings = body
 
-            results.extend(b for b in bookings if isinstance(b, dict))
+            new_bookings = []
+            for b in bookings:
+                if not isinstance(b, dict):
+                    continue
+                bid = b.get("id")
+                if bid is not None and bid in seen_ids:
+                    continue
+                if bid is not None:
+                    seen_ids.add(bid)
+                new_bookings.append(b)
+            results.extend(new_bookings)
 
             total = _as_int(_get(body, "total")) if isinstance(body, dict) else None
-            page_size = _as_int(_get(body, "pageSize")) or len(bookings)
-            if not bookings or (total is not None and len(results) >= total) or len(bookings) < page_size:
+            # pageSize aus der Antwort ist unzuverlässig (oft konstant); wir setzen
+            # die Obergrenze auf den angeforderten Wert, damit der "letzte Seite"-
+            # Abbruch verlässlich greift.
+            page_size = min(_as_int(_get(body, "pageSize")) or requested_page_size, requested_page_size)
+
+            log.info(
+                "get_reservations: Seite %d -> %d Buchungen (%d neu, %d dup), kum.=%d, total=%s",
+                page, len(bookings), len(new_bookings), len(bookings) - len(new_bookings),
+                len(results), total,
+            )
+
+            # Abbruchbedingungen (jede einzeln geloggt zur Diagnose):
+            if not bookings:
+                log.info("get_reservations: Abbruch, Seite %d leer.", page)
+                break
+            if not new_bookings:
+                log.warning(
+                    "get_reservations: Abbruch, Seite %d brachte keine neuen Buchungen "
+                    "(moegliche Endlosschleife durch API verhindert).", page,
+                )
+                break
+            if total is not None and len(results) >= total:
+                log.info("get_reservations: Abbruch, total=%d erreicht (kum=%d).", total, len(results))
+                break
+            if len(bookings) < page_size:
+                log.info("get_reservations: Abbruch, letzte Seite (%d < %d).", len(bookings), page_size)
                 break
             page += 1
-            if page > 1000:  # Sicherheitsbremse
-                break
+
+        if page > max_pages:
+            log.warning(
+                "get_reservations: Sicherheitsbremse bei %d Seiten erreicht (%d Buchungen). "
+                "Abbruch erzwungen, um Endlosschleife zu vermeiden.",
+                max_pages, len(results),
+            )
+        log.info("get_reservations: fertig, %d Buchungen gesamt.", len(results))
         return results
 
     def get_booking(self, booking_id: int) -> dict[str, Any]:
@@ -260,7 +357,9 @@ class SmoobuClient:
         try:
             data = self.request("GET", f"/api/booking/{booking_id}/price-elements")
         except SmoobuError as err:
-            # Einige Konten liefern 404, falls keine Preiselemente hinterlegt sind.
+            # 404 ist hier ein erwarteter Fall: nicht jede Buchung hat
+            # Preiselemente (z. B. Direktbuchungen, Stornos). Steuer/Charge/Provision
+            # bleiben dann 0. _handle hat dies bereits auf INFO gestuft.
             if err.status_code == 404:
                 return []
             raise
@@ -344,6 +443,7 @@ _CHANNEL_NAMES = {
     63: "Airbnb",
     9: "Booking.com",
     24: "Booking.com",
+    13: "Direct booking",
     70: "Direkt/Smoobu",
 }
 
@@ -359,15 +459,18 @@ def _channel_payout(channel: str, price: float, commission: float) -> str:
     """Auszahlungsbetrag je nach Buchungskanal.
 
     Entspricht der Excel-Formel:
-      Airbnb:      Preis - Provision * 1,19
-      Booking.com: Preis - (Preis * 1,4 % + Provision * 1,19)
-      sonst:       "Unklar"
+      Airbnb:            Preis - Provision * 1,19
+      Direct booking:    Preis - Provision * 1,19   (versuchsweise wie Airbnb)
+      Website:           Preis - Provision * 1,19   (versuchsweise wie Airbnb)
+      Booking.com:       Preis - (Preis * 1,4 % + Provision * 1,19)
+      sonst:             "Unklar"
 
     Die Zuordnung erfolgt groß-/kleinschreibungsunabhängig anhand des
     Channel-Namens (z. B. ``channelName`` der Reservierung).
     """
     name = (channel or "").lower()
-    if "airbnb" in name:
+    # Direct booking und Website werden (versuchsweise) wie Airbnb behandelt.
+    if "airbnb" in name or "direct" in name or "website" in name:
         amount = price - commission * 1.19
         return f"{amount:.2f}"
     if "booking" in name:
@@ -489,13 +592,27 @@ class MonthlyBilling:
     # ------------------------------------------------------------------ #
     def build(self, year: int, month: int) -> list[BillingRow]:
         start_q, end_q, first, last = _month_range(year, month)
+        log.info("build: Abrechnung %04d-%02d, Abfragezeitraum %s..%s", year, month, start_q, end_q)
         apartments = self._load_apartment_names()
+        log.info("build: %d Wohnung(en) geladen.", len(apartments))
         reservations = self.client.get_reservations(start_q, end_q)
+        log.info("build: %d Reservierung(en) geladen, filtere auf Abreise im Zielmonat.", len(reservations))
 
         rows: list[BillingRow] = []
+        skipped = 0
+        skipped_status = 0
         for res in reservations:
+            # Nur aktive Buchungen beruecksichtigen. Smoobu liefert 'status'
+            # (z. B. 'booked', 'cancelled'). Stornierungen werden verworfen.
+            # Fehlt das Feld, wird die Buchung dennoch beruecksichtigt.
+            status = res.get("status")
+            if status is not None and str(status).lower() != "booked":
+                skipped_status += 1
+                continue  # keine Stornos/anderen Status
+
             departure = _parse_date(res.get("departureDate") or res.get("departure"))
             if departure is None or not (first <= departure <= last):
+                skipped += 1
                 continue  # nur Buchungen, die im Zielmonat ENDEN
 
             arrival = _parse_date(res.get("arrivalDate") or res.get("arrival")) or departure
@@ -508,7 +625,35 @@ class MonthlyBilling:
             person_nights = persons * nights
 
             apartment_id = _as_int(res.get("apartmentId") or res.get("apartment_id")) or 0
-            apartment_name = res.get("apartmentName") or apartments.get(apartment_id) or f"Apartment {apartment_id}"
+            apartment_name = res.get("apartmentName") or apartments.get(apartment_id)
+            guest_name = res.get("guestName") or _full_name(res) or ""
+
+            # Smoobu liefert in der Listen-Antwort (/api/reservations) haeufig nur
+            # gekuerzte Daten: apartmentName, guestName und teils apartmentId fehlen.
+            # In diesem Fall rufen wir die Einzelbuchung (/api/reservations/{id}) ab
+            # und ergaenzen die fehlenden Felder daraus.
+            bid = _as_int(res.get("id")) or 0
+            if (not apartment_name or not guest_name or not apartment_id) and bid:
+                log.info(
+                    "build: Buchung %s: Liste liefert apartmentId=%s, apartmentName=%r, "
+                    "guestName=%r -> lade Buchungsdetails.",
+                    bid, apartment_id, apartment_name, guest_name,
+                )
+                try:
+                    detail = self.client.get_booking(bid)
+                except SmoobuError as err:
+                    log.warning("build: Buchung %s: Detailabruf fehlgeschlagen: %s", bid, err)
+                    detail = {}
+                if isinstance(detail, dict):
+                    if not apartment_id:
+                        apartment_id = _as_int(detail.get("apartmentId") or detail.get("apartment_id")) or 0
+                    if not apartment_name:
+                        apartment_name = detail.get("apartmentName") or apartments.get(apartment_id)
+                    if not guest_name:
+                        guest_name = detail.get("guestName") or _full_name(detail) or ""
+
+            if not apartment_name:
+                apartment_name = apartments.get(apartment_id) or f"Apartment {apartment_id}"
 
             total_price = _as_number(res.get("price"))
             currency = str(res.get("priceCurrency") or res.get("currency") or res.get("currencyCode") or "EUR")
@@ -549,7 +694,7 @@ class MonthlyBilling:
                     booking_id=_as_int(res.get("id")) or 0,
                     apartment_id=apartment_id,
                     apartment_name=str(apartment_name),
-                    guest_name=str(res.get("guestName") or _full_name(res) or ""),
+                    guest_name=str(guest_name),
                     arrival=arrival.isoformat(),
                     departure=departure.isoformat(),
                     nights=nights,
@@ -569,6 +714,11 @@ class MonthlyBilling:
             )
 
         rows.sort(key=lambda r: (r.departure, r.apartment_name))
+        log.info(
+            "build: %d Zeile(n) gebaut, %d Reservierung(en) ausserhalb des Zielmonats, "
+            "%d wegen Status != booked verworfen.",
+            len(rows), skipped, skipped_status,
+        )
         return rows
 
     # ------------------------------------------------------------------ #
