@@ -23,6 +23,7 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
 import time
@@ -31,6 +32,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import urlencode, urlsplit
+
+# Detailliertes Logging, damit Endlosschleifen und API-Antworten nachvollziehbar
+# sind. Die Ausgaben sind bewusst nicht abschaltbar, da sie der Fehlersuche dienen.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("abrechnung")
 
 try:  # ``requests`` ist optional; ohne Live-Credentials nutzt der Client urllib.
     import requests  # type: ignore
@@ -164,7 +173,12 @@ class SmoobuClient:
         headers.update(self._sign(method, path_only, query, body_bytes))
 
         url = self.config.base_url + path_only + (f"?{query}" if query else "")
+        log.info("HTTP %s %s (body=%d bytes)", method.upper(), url, len(body_bytes))
         response = self._http(method, url, headers, body_bytes)
+        log.info(
+            "Antwort %s %s -> status=%d, %d bytes",
+            method.upper(), url, response.status_code, len(response.text or ""),
+        )
         return self._handle(response)
 
     def _http(self, method: str, url: str, headers: dict[str, str], body: bytes) -> "Response":
@@ -185,12 +199,14 @@ class SmoobuClient:
     def _handle(response: "Response") -> Any:
         if response.status_code == 429:
             retry = response.headers.get("X-RateLimit-Retry-After")
+            log.warning("Smoobu Rate-Limit (429). Retry-After=%s", retry)
             raise SmoobuError(
                 f"Rate-Limit überschritten (429). Retry-After: {retry}",
                 status_code=429,
                 body=response.text,
             )
         if response.status_code >= 400:
+            log.warning("Smoobu-API-Fehler %d: %s", response.status_code, response.text[:500])
             raise SmoobuError(
                 f"Smoobu-API-Fehler {response.status_code}: {response.text[:500]}",
                 status_code=response.status_code,
@@ -218,14 +234,30 @@ class SmoobuClient:
         return [a for a in apartments if isinstance(a, dict)]
 
     def get_reservations(self, from_date: str, to_date: str) -> list[dict[str, Any]]:
-        """Liefert alle Reservierungen im Zeitraum ``from_date``..``to_date``."""
+        """Liefert alle Reservierungen im Zeitraum ``from_date``..``to_date``.
+
+        Paginierung mit mehreren Sicherheitsnetzen gegen Endlosschleifen:
+
+        - Abbruch, sobald eine Seite keine *neuen* Buchungen mehr liefert
+          (die API wiederholt dieselbe Seite => sonst Endlosschleife).
+        - Abbruch bei ``len(bookings) < requested_page_size`` (letzte Seite).
+        - Abbruch, sobald ``total`` erreicht ist (falls gemeldet).
+        - harte Begrenzung auf ``MAX_PAGES`` Seiten.
+        """
+        requested_page_size = 100
+        max_pages = 1000  # Sicherheitsbremse
         results: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
         page = 1
-        while True:
+        log.info(
+            "get_reservations: von=%s bis=%s, pageSize=%d, maxPages=%d",
+            from_date, to_date, requested_page_size, max_pages,
+        )
+        while page <= max_pages:
             data = self.request(
                 "GET",
                 "/api/reservations",
-                params={"from": from_date, "to": to_date, "page": page, "pageSize": 100},
+                params={"from": from_date, "to": to_date, "page": page, "pageSize": requested_page_size},
             )
             body = data.get("body", data) if isinstance(data, dict) else data
             bookings = []
@@ -239,15 +271,55 @@ class SmoobuClient:
             elif isinstance(body, list):
                 bookings = body
 
-            results.extend(b for b in bookings if isinstance(b, dict))
+            new_bookings = []
+            for b in bookings:
+                if not isinstance(b, dict):
+                    continue
+                bid = b.get("id")
+                if bid is not None and bid in seen_ids:
+                    continue
+                if bid is not None:
+                    seen_ids.add(bid)
+                new_bookings.append(b)
+            results.extend(new_bookings)
 
             total = _as_int(_get(body, "total")) if isinstance(body, dict) else None
-            page_size = _as_int(_get(body, "pageSize")) or len(bookings)
-            if not bookings or (total is not None and len(results) >= total) or len(bookings) < page_size:
+            # pageSize aus der Antwort ist unzuverlässig (oft konstant); wir setzen
+            # die Obergrenze auf den angeforderten Wert, damit der "letzte Seite"-
+            # Abbruch verlässlich greift.
+            page_size = min(_as_int(_get(body, "pageSize")) or requested_page_size, requested_page_size)
+
+            log.info(
+                "get_reservations: Seite %d -> %d Buchungen (%d neu, %d dup), kum.=%d, total=%s",
+                page, len(bookings), len(new_bookings), len(bookings) - len(new_bookings),
+                len(results), total,
+            )
+
+            # Abbruchbedingungen (jede einzeln geloggt zur Diagnose):
+            if not bookings:
+                log.info("get_reservations: Abbruch, Seite %d leer.", page)
+                break
+            if not new_bookings:
+                log.warning(
+                    "get_reservations: Abbruch, Seite %d brachte keine neuen Buchungen "
+                    "(moegliche Endlosschleife durch API verhindert).", page,
+                )
+                break
+            if total is not None and len(results) >= total:
+                log.info("get_reservations: Abbruch, total=%d erreicht (kum=%d).", total, len(results))
+                break
+            if len(bookings) < page_size:
+                log.info("get_reservations: Abbruch, letzte Seite (%d < %d).", len(bookings), page_size)
                 break
             page += 1
-            if page > 1000:  # Sicherheitsbremse
-                break
+
+        if page > max_pages:
+            log.warning(
+                "get_reservations: Sicherheitsbremse bei %d Seiten erreicht (%d Buchungen). "
+                "Abbruch erzwungen, um Endlosschleife zu vermeiden.",
+                max_pages, len(results),
+            )
+        log.info("get_reservations: fertig, %d Buchungen gesamt.", len(results))
         return results
 
     def get_booking(self, booking_id: int) -> dict[str, Any]:
@@ -489,13 +561,18 @@ class MonthlyBilling:
     # ------------------------------------------------------------------ #
     def build(self, year: int, month: int) -> list[BillingRow]:
         start_q, end_q, first, last = _month_range(year, month)
+        log.info("build: Abrechnung %04d-%02d, Abfragezeitraum %s..%s", year, month, start_q, end_q)
         apartments = self._load_apartment_names()
+        log.info("build: %d Wohnung(en) geladen.", len(apartments))
         reservations = self.client.get_reservations(start_q, end_q)
+        log.info("build: %d Reservierung(en) geladen, filtere auf Abreise im Zielmonat.", len(reservations))
 
         rows: list[BillingRow] = []
+        skipped = 0
         for res in reservations:
             departure = _parse_date(res.get("departureDate") or res.get("departure"))
             if departure is None or not (first <= departure <= last):
+                skipped += 1
                 continue  # nur Buchungen, die im Zielmonat ENDEN
 
             arrival = _parse_date(res.get("arrivalDate") or res.get("arrival")) or departure
@@ -569,6 +646,7 @@ class MonthlyBilling:
             )
 
         rows.sort(key=lambda r: (r.departure, r.apartment_name))
+        log.info("build: %d Zeile(n) gebaut, %d Reservierung(en) verworfen.", len(rows), skipped)
         return rows
 
     # ------------------------------------------------------------------ #
