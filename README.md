@@ -44,7 +44,7 @@ API-Key und API-Secret werden in Smoobu unter
 Die Zugangsdaten werden über die Umgebungsvariablen bereitgestellt:
 
 - `SMOOBU_LABEL` – der API-Key (Label)
-- `SMOOBU_KEY` – das API-Secret
+- `SMOOBU_SECRET` – das API-Secret
 
 ## Einrichtung
 
@@ -53,7 +53,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# .env mit SMOOBU_LABEL (API-Key) und SMOOBU_KEY (API-Secret) befüllen
+# .env mit SMOOBU_LABEL (API-Key) und SMOOBU_SECRET (API-Secret) befüllen
 ```
 
 ## Nutzung

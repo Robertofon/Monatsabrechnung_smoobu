@@ -59,13 +59,13 @@ class SmoobuConfig:
     """
 
     api_key: str = field(default_factory=lambda: os.getenv("SMOOBU_LABEL", ""))
-    api_secret: str = field(default_factory=lambda: os.getenv("SMOOBU_KEY", ""))
+    api_secret: str = field(default_factory=lambda: os.getenv("SMOOBU_SECRET", ""))
     base_url: str = field(default_factory=lambda: os.getenv("SMOOBU_BASE_URL", BASE_URL))
 
     def validate(self) -> None:
         if not self.api_key or not self.api_secret:
             raise ValueError(
-                "SMOOBU_LABEL und SMOOBU_KEY müssen gesetzt sein "
+                "SMOOBU_LABEL und SMOOBU_SECRET müssen gesetzt sein "
                 "(Umgebungsvariablen oder Konstruktor)."
             )
 
@@ -613,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--api-secret",
         default=None,
-        help="Smoobu API-Secret (überschreibt SMOOBU_KEY).",
+        help="Smoobu API-Secret (überschreibt SMOOBU_SECRET).",
     )
     args = parser.parse_args(argv)
 
