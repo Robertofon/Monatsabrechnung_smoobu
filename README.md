@@ -41,6 +41,11 @@ wird signiert mit `X-API-Key`, `X-Timestamp`, `X-Nonce` (UUID v4) und
 API-Key und API-Secret werden in Smoobu unter
 **Einstellungen → Advanced → API Keys** erzeugt.
 
+Die Zugangsdaten werden über die Umgebungsvariablen bereitgestellt:
+
+- `SMOOBU_LABEL` – der API-Key (Label)
+- `SMOOBU_KEY` – das API-Secret
+
 ## Einrichtung
 
 ```bash
@@ -48,7 +53,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# .env mit SMOOBU_API_KEY und SMOOBU_API_SECRET befüllen
+# .env mit SMOOBU_LABEL (API-Key) und SMOOBU_KEY (API-Secret) befüllen
 ```
 
 ## Nutzung

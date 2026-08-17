@@ -58,14 +58,14 @@ class SmoobuConfig:
     Werte können über Umgebungsvariablen oder den Konstruktor gesetzt werden.
     """
 
-    api_key: str = field(default_factory=lambda: os.getenv("SMOOBU_API_KEY", ""))
-    api_secret: str = field(default_factory=lambda: os.getenv("SMOOBU_API_SECRET", ""))
+    api_key: str = field(default_factory=lambda: os.getenv("SMOOBU_LABEL", ""))
+    api_secret: str = field(default_factory=lambda: os.getenv("SMOOBU_KEY", ""))
     base_url: str = field(default_factory=lambda: os.getenv("SMOOBU_BASE_URL", BASE_URL))
 
     def validate(self) -> None:
         if not self.api_key or not self.api_secret:
             raise ValueError(
-                "SMOOBU_API_KEY und SMOOBU_API_SECRET müssen gesetzt sein "
+                "SMOOBU_LABEL und SMOOBU_KEY müssen gesetzt sein "
                 "(Umgebungsvariablen oder Konstruktor)."
             )
 
@@ -608,12 +608,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Smoobu API-Key (überschreibt SMOOBU_API_KEY).",
+        help="Smoobu API-Key/Label (überschreibt SMOOBU_LABEL).",
     )
     parser.add_argument(
         "--api-secret",
         default=None,
-        help="Smoobu API-Secret (überschreibt SMOOBU_API_SECRET).",
+        help="Smoobu API-Secret (überschreibt SMOOBU_KEY).",
     )
     args = parser.parse_args(argv)
 
