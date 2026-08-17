@@ -612,7 +612,35 @@ class MonthlyBilling:
             person_nights = persons * nights
 
             apartment_id = _as_int(res.get("apartmentId") or res.get("apartment_id")) or 0
-            apartment_name = res.get("apartmentName") or apartments.get(apartment_id) or f"Apartment {apartment_id}"
+            apartment_name = res.get("apartmentName") or apartments.get(apartment_id)
+            guest_name = res.get("guestName") or _full_name(res) or ""
+
+            # Smoobu liefert in der Listen-Antwort (/api/reservations) haeufig nur
+            # gekuerzte Daten: apartmentName, guestName und teils apartmentId fehlen.
+            # In diesem Fall rufen wir die Einzelbuchung (/api/reservations/{id}) ab
+            # und ergaenzen die fehlenden Felder daraus.
+            bid = _as_int(res.get("id")) or 0
+            if (not apartment_name or not guest_name or not apartment_id) and bid:
+                log.info(
+                    "build: Buchung %s: Liste liefert apartmentId=%s, apartmentName=%r, "
+                    "guestName=%r -> lade Buchungsdetails.",
+                    bid, apartment_id, apartment_name, guest_name,
+                )
+                try:
+                    detail = self.client.get_booking(bid)
+                except SmoobuError as err:
+                    log.warning("build: Buchung %s: Detailabruf fehlgeschlagen: %s", bid, err)
+                    detail = {}
+                if isinstance(detail, dict):
+                    if not apartment_id:
+                        apartment_id = _as_int(detail.get("apartmentId") or detail.get("apartment_id")) or 0
+                    if not apartment_name:
+                        apartment_name = detail.get("apartmentName") or apartments.get(apartment_id)
+                    if not guest_name:
+                        guest_name = detail.get("guestName") or _full_name(detail) or ""
+
+            if not apartment_name:
+                apartment_name = apartments.get(apartment_id) or f"Apartment {apartment_id}"
 
             total_price = _as_number(res.get("price"))
             currency = str(res.get("priceCurrency") or res.get("currency") or res.get("currencyCode") or "EUR")
@@ -653,7 +681,7 @@ class MonthlyBilling:
                     booking_id=_as_int(res.get("id")) or 0,
                     apartment_id=apartment_id,
                     apartment_name=str(apartment_name),
-                    guest_name=str(res.get("guestName") or _full_name(res) or ""),
+                    guest_name=str(guest_name),
                     arrival=arrival.isoformat(),
                     departure=departure.isoformat(),
                     nights=nights,
