@@ -179,7 +179,7 @@ class SmoobuClient:
             "Antwort %s %s -> status=%d, %d bytes",
             method.upper(), url, response.status_code, len(response.text or ""),
         )
-        return self._handle(response)
+        return self._handle(response, path_only)
 
     def _http(self, method: str, url: str, headers: dict[str, str], body: bytes) -> "Response":
         if requests is not None:
@@ -196,7 +196,11 @@ class SmoobuClient:
             return Response(e.code, e.read().decode("utf-8", "replace"), dict(e.headers))
 
     @staticmethod
-    def _handle(response: "Response") -> Any:
+    def _handle(response: "Response", path: str = "") -> Any:
+        # 404 auf /api/booking/{id}/price-elements ist ein erwarteter Fall:
+        # nicht jede Buchung hat Preiselemente. Daher nur INFO statt WARNING;
+        # get_price_elements faengt die Ausnahme ab und liefert [].
+        expected_404 = path.endswith("/price-elements") and response.status_code == 404
         if response.status_code == 429:
             retry = response.headers.get("X-RateLimit-Retry-After")
             log.warning("Smoobu Rate-Limit (429). Retry-After=%s", retry)
@@ -206,7 +210,28 @@ class SmoobuClient:
                 body=response.text,
             )
         if response.status_code >= 400:
-            log.warning("Smoobu-API-Fehler %d: %s", response.status_code, response.text[:500])
+            snippet = response.text[:500]
+            # Smoobu liefert bei Fehlern (z. B. 404) oft eine HTML-Seite statt JSON.
+            # Diese nicht als Text ins Log schreiben, sondern nur grob kennzeichnen.
+            stripped = snippet.lstrip().lower()
+            is_html = stripped.startswith("<!doctype") or stripped.startswith("<html")
+            if expected_404:
+                if is_html:
+                    log.info(
+                        "price-elements: 404 fuer %s, HTML-Antwort (%d bytes) - erwartet, "
+                        "keine Preiselemente.",
+                        path, len(response.text or ""),
+                    )
+                else:
+                    log.info("price-elements: 404 fuer %s - erwartet, keine Preiselemente.", path)
+            else:
+                if is_html:
+                    log.warning(
+                        "Smoobu-API-Fehler %d: HTML-Antwort (%d bytes) statt JSON.",
+                        response.status_code, len(response.text or ""),
+                    )
+                else:
+                    log.warning("Smoobu-API-Fehler %d: %s", response.status_code, snippet)
             raise SmoobuError(
                 f"Smoobu-API-Fehler {response.status_code}: {response.text[:500]}",
                 status_code=response.status_code,
@@ -332,7 +357,9 @@ class SmoobuClient:
         try:
             data = self.request("GET", f"/api/booking/{booking_id}/price-elements")
         except SmoobuError as err:
-            # Einige Konten liefern 404, falls keine Preiselemente hinterlegt sind.
+            # 404 ist hier ein erwarteter Fall: nicht jede Buchung hat
+            # Preiselemente (z. B. Direktbuchungen, Stornos). Steuer/Charge/Provision
+            # bleiben dann 0. _handle hat dies bereits auf INFO gestuft.
             if err.status_code == 404:
                 return []
             raise
