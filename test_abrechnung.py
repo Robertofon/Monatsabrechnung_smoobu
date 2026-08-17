@@ -63,6 +63,8 @@ def _reservation(
     prepayment_status=1,
     price_status=1,
     price_elements=None,
+    channel_id=63,
+    channel_name="Airbnb",
     first_name="Max",
     last_name="Mustermann",
 ):
@@ -80,6 +82,8 @@ def _reservation(
         "priceCurrency": "EUR",
         "firstName": first_name,
         "lastName": last_name,
+        "channelId": channel_id,
+        "channelName": channel_name,
         "priceElements": price_elements or [],
     }
 
@@ -96,6 +100,7 @@ RESERVATIONS = [
             {"type": "cleaningFee", "amount": 30.0},
             {"type": "tax", "amount": 20.0},
             {"type": "paymentCharge", "amount": 10.0},
+            {"type": "commission", "amount": 50.0},
         ],
     ),
     # Endet am 01.05.2026 -> NICHT im Zielmonat April
@@ -234,6 +239,73 @@ def test_preiselemente_endpoint_wird_nicht_angerufen_wenn_in_reservierung_vorhan
     client = FakeClient(APARTMENTS, RESERVATIONS)
     abrechnung.MonthlyBilling(client).build(2026, 4)
     assert client.get_price_elements_calls == 0
+
+
+# ---------------------------------------------------------------------- #
+# Channel & Auszahlungsbetrag (Formel)
+# ---------------------------------------------------------------------- #
+def test_channel_wird_aus_reservierung_ermittelt():
+    rows = {r.booking_id: r for r in make_billing().build(2026, 4)}
+    assert rows[101].channel == "Airbnb"
+    assert rows[103].channel == "Airbnb"
+
+
+def test_provision_wird_separat_erfasst():
+    rows = {r.booking_id: r for r in make_billing().build(2026, 4)}
+    # Buchung 101 hat commission 50; payment_charge bleibt 10 (nicht mehr summiert)
+    r = rows[101]
+    assert r.commission == 50.0
+    assert r.payment_charge == 10.0
+    # Buchung 103 ohne commission -> 0
+    assert rows[103].commission == 0.0
+
+
+def test_channel_payout_airbnb_formel():
+    rows = {r.booking_id: r for r in make_billing().build(2026, 4)}
+    r = rows[101]
+    # Airbnb: Preis(500) - Provision(50) * 1,19 = 500 - 59,5 = 440,50
+    assert r.channel_payout == f"{500.0 - 50.0 * 1.19:.2f}"
+    assert r.channel_payout == "440.50"
+
+
+def test_channel_payout_booking_formel():
+    reservation = _reservation(
+        400, 1, "2026-04-01", "2026-04-05", price=300.0, prepayment=300.0,
+        channel_id=9, channel_name="Booking.com",
+        price_elements=[{"type": "commission", "amount": 30.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[400]
+    # Booking.com: 300 - (300 * 0,014 + 30 * 1,19) = 300 - (4,2 + 35,7) = 260,10
+    expected = 300.0 - (300.0 * 0.014 + 30.0 * 1.19)
+    assert r.channel_payout == f"{expected:.2f}"
+    assert r.channel_payout == "260.10"
+
+
+def test_channel_payout_unbekannt():
+    reservation = _reservation(
+        500, 1, "2026-04-01", "2026-04-05", price=200.0, prepayment=200.0,
+        channel_name="Expedia",
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    assert rows[500].channel_payout == "Unklar"
+
+
+def test_channel_payout_fallback_ueber_channel_id():
+    # Kein channelName, nur channelId -> Fallback über Mapping.
+    reservation = _reservation(
+        600, 1, "2026-04-01", "2026-04-05", price=200.0, prepayment=200.0,
+        channel_id=9, channel_name=None,
+        price_elements=[{"type": "commission", "amount": 20.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[600]
+    assert r.channel == "Booking.com"
+    assert r.channel_payout == f"{200.0 - (200.0 * 0.014 + 20.0 * 1.19):.2f}"
+
 
 
 # ---------------------------------------------------------------------- #

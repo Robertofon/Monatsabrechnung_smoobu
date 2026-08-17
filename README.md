@@ -20,7 +20,10 @@ Pro Buchung werden ermittelt:
 | **Personennächte**  | Personen × Nächte |
 | Gesamtpreis         | `price` der Buchung |
 | Steuer              | Summe aller Preiselemente vom Typ `tax`/`vat` |
-| Payment-Charge      | Summe aller Preiselemente vom Typ `paymentCharge`/`commission` |
+| Payment-Charge      | Summe aller Preiselemente vom Typ `paymentCharge` |
+| Provision            | Summe aller Preiselemente vom Typ `commission` |
+| Channel              | Buchungskanal (Airbnb, Booking.com, ...) aus `channelName`/`channelId` |
+| Auszahlung (Channel) | `Airbnb`: Preis − Provision×1,19 · `Booking.com`: Preis − (Preis×1,4 % + Provision×1,19) · sonst "Unklar" |
 | Bezahlter Betrag    | `prepayment` (sofern `prepaymentStatus = 1`) |
 | Überwiesener Betrag | Gesamtpreis − Steuer − Payment-Charge (nur bei bezahlten Buchungen) |
 | Währung / Preisstatus | Währung + Zahlungsstatus |

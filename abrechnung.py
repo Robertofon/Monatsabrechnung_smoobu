@@ -339,6 +339,43 @@ def _nights(arrival: date, departure: date) -> int:
     return delta if delta > 0 else 0
 
 
+# Bekannte Smoobu-Channel-IDs (Auszug) für den Fallback, falls channelName fehlt.
+_CHANNEL_NAMES = {
+    63: "Airbnb",
+    9: "Booking.com",
+    24: "Booking.com",
+    70: "Direkt/Smoobu",
+}
+
+
+def _channel_name(channel_id: Any) -> str:
+    cid = _as_int(channel_id)
+    if cid is None:
+        return ""
+    return _CHANNEL_NAMES.get(cid, "")
+
+
+def _channel_payout(channel: str, price: float, commission: float) -> str:
+    """Auszahlungsbetrag je nach Buchungskanal.
+
+    Entspricht der Excel-Formel:
+      Airbnb:      Preis - Provision * 1,19
+      Booking.com: Preis - (Preis * 1,4 % + Provision * 1,19)
+      sonst:       "Unklar"
+
+    Die Zuordnung erfolgt groß-/kleinschreibungsunabhängig anhand des
+    Channel-Namens (z. B. ``channelName`` der Reservierung).
+    """
+    name = (channel or "").lower()
+    if "airbnb" in name:
+        amount = price - commission * 1.19
+        return f"{amount:.2f}"
+    if "booking" in name:
+        amount = price - (price * 0.014 + commission * 1.19)
+        return f"{amount:.2f}"
+    return "Unklar"
+
+
 def _month_range(year: int, month: int) -> tuple[str, str, date, date]:
     """Liefert den Abfragezeitraum für einen Monat.
 
@@ -372,6 +409,9 @@ class BillingRow:
     total_price: float
     tax: float
     payment_charge: float
+    commission: float  # Provision (Channel-Provision)
+    channel: str  # Buchungskanal (Airbnb, Booking.com, ...)
+    channel_payout: str  # Auszahlungsbetrag je nach Channel (Formel) oder "Unklar"
     paid_amount: float  # bezahlter Betrag
     transferred_amount: float  # überwiesener Betrag
     currency: str
@@ -391,6 +431,9 @@ class BillingRow:
             f"{self.total_price:.2f}",
             f"{self.tax:.2f}",
             f"{self.payment_charge:.2f}",
+            f"{self.commission:.2f}",
+            self.channel,
+            self.channel_payout,
             f"{self.paid_amount:.2f}",
             f"{self.transferred_amount:.2f}",
             self.currency,
@@ -411,6 +454,9 @@ CSV_HEADERS = [
     "Gesamtpreis",
     "Steuer",
     "Payment-Charge",
+    "Provision",
+    "Channel",
+    "Auszahlungsbetrag (Channel)",
     "Bezahlter Betrag",
     "Überwiesener Betrag",
     "Währung",
@@ -472,8 +518,23 @@ class MonthlyBilling:
             paid_amount = _as_number(res.get("prepayment"))
             prepayment_status = _as_int(res.get("prepaymentStatus"))
 
-            # Preiselemente (Steuer, Payment-Charge) abrufen, falls vorhanden.
-            tax, payment_charge = self._price_breakdown(res, res.get("id"))
+            # Preiselemente (Steuer, Payment-Charge, Provision) abrufen.
+            tax, payment_charge, commission = self._price_breakdown(res, res.get("id"))
+
+            # Buchungskanal ermitteln. Smoobu liefert channelId und teilweise
+            # channelName; letzteres ist verlässlicher für die Zuordnung.
+            channel = str(
+                res.get("channelName")
+                or res.get("channel")
+                or _channel_name(res.get("channelId"))
+                or "Unbekannt"
+            )
+
+            # Auszahlungsbetrag je nach Channel:
+            #   Airbnb:      Preis - Provision * 1,19
+            #   Booking.com: Preis - (Preis * 1,4 % + Provision * 1,19)
+            #   sonst:       "Unklar"
+            channel_payout = _channel_payout(channel, total_price, commission)
 
             # Überwiesener Betrag: Gesamtpreis abzüglich Gebühren/Steuer
             # (Nettoauszahlung an den Vermieter).
@@ -497,6 +558,9 @@ class MonthlyBilling:
                     total_price=total_price,
                     tax=tax,
                     payment_charge=payment_charge,
+                    commission=commission,
+                    channel=channel,
+                    channel_payout=channel_payout,
                     paid_amount=paid_amount,
                     transferred_amount=transferred_amount,
                     currency=currency,
@@ -513,7 +577,8 @@ class MonthlyBilling:
 
         Smoobu liefert pro Preiselement ein ``type``-Feld (z. B. ``basePrice``,
         ``cleaningFee``, ``tax``, ``paymentCharge``, ``commission``). Wir summieren
-        die Beträge der Typen ``tax`` und ``paymentCharge``.
+        die Beträge der Typen ``tax`` und ``paymentCharge``; Provisionen
+        (``commission``) werden separat zurückgegeben.
         """
         elements = reservation.get("priceElements")
         if isinstance(elements, list) and elements:
@@ -525,14 +590,17 @@ class MonthlyBilling:
 
         tax = 0.0
         payment_charge = 0.0
+        commission = 0.0
         for elem in price_elements:
             etype = str(elem.get("type", "")).lower()
             amount = _as_number(elem.get("amount"))
             if etype in ("tax", "vat", "steuer"):
                 tax += amount
-            elif etype in ("paymentcharge", "payment_charge", "payment-charge", "commission", "gebuehr"):
+            elif etype in ("commission", "provision"):
+                commission += amount
+            elif etype in ("paymentcharge", "payment_charge", "payment-charge", "gebuehr"):
                 payment_charge += amount
-        return tax, payment_charge
+        return tax, payment_charge, commission
 
 
 def _full_name(reservation: dict[str, Any]) -> str:
@@ -561,6 +629,7 @@ def print_summary(rows: list[BillingRow], year: int, month: int) -> None:
         f"  Gesamtpreis gesamt:        {sum(r.total_price for r in rows):.2f}\n"
         f"  Steuer gesamt:             {sum(r.tax for r in rows):.2f}\n"
         f"  Payment-Charge gesamt:     {sum(r.payment_charge for r in rows):.2f}\n"
+        f"  Provision gesamt:          {sum(r.commission for r in rows):.2f}\n"
         f"  Bezahlter Betrag gesamt:   {sum(r.paid_amount for r in rows):.2f}\n"
         f"  Überwiesener Betrag gesamt:{sum(r.transferred_amount for r in rows):.2f}\n"
         f"  Personennächte gesamt:     {sum(r.person_nights for r in rows)}"
