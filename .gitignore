@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+abrechnung_*.csv
+.venv/
+venv/
