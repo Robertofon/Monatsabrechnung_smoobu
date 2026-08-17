@@ -443,6 +443,7 @@ _CHANNEL_NAMES = {
     63: "Airbnb",
     9: "Booking.com",
     24: "Booking.com",
+    13: "Direct booking",
     70: "Direkt/Smoobu",
 }
 
@@ -458,15 +459,18 @@ def _channel_payout(channel: str, price: float, commission: float) -> str:
     """Auszahlungsbetrag je nach Buchungskanal.
 
     Entspricht der Excel-Formel:
-      Airbnb:      Preis - Provision * 1,19
-      Booking.com: Preis - (Preis * 1,4 % + Provision * 1,19)
-      sonst:       "Unklar"
+      Airbnb:            Preis - Provision * 1,19
+      Direct booking:    Preis - Provision * 1,19   (versuchsweise wie Airbnb)
+      Website:           Preis - Provision * 1,19   (versuchsweise wie Airbnb)
+      Booking.com:       Preis - (Preis * 1,4 % + Provision * 1,19)
+      sonst:             "Unklar"
 
     Die Zuordnung erfolgt groß-/kleinschreibungsunabhängig anhand des
     Channel-Namens (z. B. ``channelName`` der Reservierung).
     """
     name = (channel or "").lower()
-    if "airbnb" in name:
+    # Direct booking und Website werden (versuchsweise) wie Airbnb behandelt.
+    if "airbnb" in name or "direct" in name or "website" in name:
         amount = price - commission * 1.19
         return f"{amount:.2f}"
     if "booking" in name:
@@ -596,7 +600,16 @@ class MonthlyBilling:
 
         rows: list[BillingRow] = []
         skipped = 0
+        skipped_status = 0
         for res in reservations:
+            # Nur aktive Buchungen beruecksichtigen. Smoobu liefert 'status'
+            # (z. B. 'booked', 'cancelled'). Stornierungen werden verworfen.
+            # Fehlt das Feld, wird die Buchung dennoch beruecksichtigt.
+            status = res.get("status")
+            if status is not None and str(status).lower() != "booked":
+                skipped_status += 1
+                continue  # keine Stornos/anderen Status
+
             departure = _parse_date(res.get("departureDate") or res.get("departure"))
             if departure is None or not (first <= departure <= last):
                 skipped += 1
@@ -701,7 +714,11 @@ class MonthlyBilling:
             )
 
         rows.sort(key=lambda r: (r.departure, r.apartment_name))
-        log.info("build: %d Zeile(n) gebaut, %d Reservierung(en) verworfen.", len(rows), skipped)
+        log.info(
+            "build: %d Zeile(n) gebaut, %d Reservierung(en) ausserhalb des Zielmonats, "
+            "%d wegen Status != booked verworfen.",
+            len(rows), skipped, skipped_status,
+        )
         return rows
 
     # ------------------------------------------------------------------ #

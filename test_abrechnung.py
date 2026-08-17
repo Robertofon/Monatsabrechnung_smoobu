@@ -307,6 +307,76 @@ def test_channel_payout_fallback_ueber_channel_id():
     assert r.channel_payout == f"{200.0 - (200.0 * 0.014 + 20.0 * 1.19):.2f}"
 
 
+def test_channel_payout_direct_booking_wie_airbnb():
+    # Direct booking wird (versuchsweise) wie Airbnb berechnet: Preis - Provision*1,19
+    reservation = _reservation(
+        700, 1, "2026-04-01", "2026-04-05", price=200.0, prepayment=200.0,
+        channel_id=13, channel_name="Direct booking",
+        price_elements=[{"type": "commission", "amount": 20.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[700]
+    assert r.channel == "Direct booking"
+    assert r.channel_payout == f"{200.0 - 20.0 * 1.19:.2f}"
+
+
+def test_channel_payout_website_wie_airbnb():
+    # Website wird (versuchsweise) wie Airbnb berechnet: Preis - Provision*1,19
+    reservation = _reservation(
+        701, 1, "2026-04-01", "2026-04-05", price=200.0, prepayment=200.0,
+        channel_name="Website",
+        price_elements=[{"type": "commission", "amount": 20.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[701]
+    assert r.channel == "Website"
+    assert r.channel_payout == f"{200.0 - 20.0 * 1.19:.2f}"
+
+
+def test_channel_payout_direct_booking_fallback_ueber_channel_id():
+    # channel_id=13 ohne channelName -> Fallback "Direct booking" -> Airbnb-Formel
+    reservation = _reservation(
+        702, 1, "2026-04-01", "2026-04-05", price=200.0, prepayment=200.0,
+        channel_id=13, channel_name=None,
+        price_elements=[{"type": "commission", "amount": 20.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[702]
+    assert r.channel == "Direct booking"
+    assert r.channel_payout == f"{200.0 - 20.0 * 1.19:.2f}"
+
+
+def test_status_filter_verwirft_stornos():
+    # Stornierte Buchungen (status != 'booked') duerfen nicht in der Abrechnung landen.
+    booked = _reservation(
+        800, 1, "2026-04-01", "2026-04-05", price=100.0, prepayment=100.0,
+    )
+    cancelled = _reservation(
+        801, 1, "2026-04-02", "2026-04-06", price=999.0, prepayment=0.0,
+        prepayment_status=0, price_status=0,
+    )
+    cancelled["status"] = "cancelled"
+    booked["status"] = "booked"
+    client = FakeClient(APARTMENTS, [booked, cancelled])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    assert 800 in rows
+    assert 801 not in rows
+
+
+def test_status_fehlend_wird_behalten():
+    # Fehlt das status-Feld, wird die Buchung (defensiv) weiter beruecksichtigt.
+    reservation = _reservation(
+        802, 1, "2026-04-01", "2026-04-05", price=100.0, prepayment=100.0,
+    )
+    assert "status" not in reservation
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    assert 802 in rows
+
+
 
 # ---------------------------------------------------------------------- #
 # CSV-Export
