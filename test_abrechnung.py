@@ -377,6 +377,77 @@ def test_status_fehlend_wird_behalten():
     assert 802 in rows
 
 
+def test_storno_typ_und_sperrung_werden_ausgefiltert():
+    cancelled = _reservation(810, 1, "2026-04-01", "2026-04-05", price=100.0, prepayment=100.0)
+    cancelled["type"] = "cancellation"
+    blocked = _reservation(811, 1, "2026-04-02", "2026-04-06", price=100.0, prepayment=100.0)
+    blocked["is-blocked-booking"] = True
+    booked = _reservation(812, 1, "2026-04-03", "2026-04-07", price=100.0, prepayment=100.0)
+    booked["status"] = "booked"
+    client = FakeClient(APARTMENTS, [cancelled, blocked, booked])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    assert 810 not in rows
+    assert 811 not in rows
+    assert 812 in rows
+
+
+def test_gast_und_unterkunft_sind_gesetzt():
+    rows = {r.booking_id: r for r in make_billing().build(2026, 4)}
+    r = rows[101]
+    assert r.guest_name == "Max Mustermann"
+    assert r.apartment_name == "Ferienwohnung Nord"
+
+
+def test_smoobu_listenformat_liefert_gast_unterkunft_channel():
+    reservation = {
+        "id": 900,
+        "arrival": "2026-04-01",
+        "departure": "2026-04-05",
+        "adults": 2,
+        "children": 0,
+        "price": 180.0,
+        "prepayment": 180.0,
+        "prepaymentStatus": 1,
+        "priceStatus": 1,
+        "priceCurrency": "EUR",
+        "apartment": {"id": 1, "name": "Ferienwohnung Nord"},
+        "guest-name": "Erika Muster",
+        "channel": {"id": 63, "name": "Airbnb"},
+        "priceElements": [{"type": "commission", "amount": 20.0}],
+        "status": "booked",
+    }
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[900]
+    assert r.guest_name == "Erika Muster"
+    assert r.apartment_name == "Ferienwohnung Nord"
+    assert r.apartment_id == 1
+    assert r.channel == "Airbnb"
+
+
+def test_ermittelte_einnahme_booking_com_formel():
+    reservation = _reservation(
+        400, 1, "2026-04-01", "2026-04-05", price=300.0, prepayment=300.0,
+        channel_id=9, channel_name="Booking.com",
+        price_elements=[{"type": "commission", "amount": 30.0}],
+    )
+    client = FakeClient(APARTMENTS, [reservation])
+    rows = {r.booking_id: r for r in abrechnung.MonthlyBilling(client).build(2026, 4)}
+    r = rows[400]
+    # Excel: P3-(P3*1,4%+R3*1,19) = 300 - (300*0,014 + 30*1,19) = 260,10
+    expected = 300.0 - (300.0 * 0.014 + 30.0 * 1.19)
+    assert r.net_revenue == round(expected, 2)
+    assert r.net_revenue == 260.10
+
+
+def test_ermittelte_einnahme_airbnb_formel():
+    rows = {r.booking_id: r for r in make_billing().build(2026, 4)}
+    r = rows[101]
+    # Airbnb: Preis(500) - Provision(50)*1,19 = 440,50
+    assert r.net_revenue == round(500.0 - 50.0 * 1.19, 2)
+    assert rows[103].net_revenue == 200.0
+
+
 
 # ---------------------------------------------------------------------- #
 # CSV-Export
@@ -390,13 +461,35 @@ def test_csv_export_enthält_personennächte_spalte():
         header = next(reader)
         data = list(reader)
 
+    assert "Personen" in header
     assert "Personennächte" in header
+    assert "Ermittelte Einnahme" in header
+    assert "Preisstatus" not in header
+    assert header.index("Ermittelte Einnahme") == header.index("Gesamtpreis") - 1
     assert header == abrechnung.CSV_HEADERS
-    assert len(data) == 2  # zwei Buchungen im April
-    # Personennächte-Spalte ist der 9. Wert (Index 8)
+    dep_index = header.index("Abreise")
+    assert data[-2][dep_index] == "Summe"
+    assert data[-1][dep_index] == "Steuer 5%"
+    assert data[-2][0] == ""
+    assert data[-1][0] == ""
+    bookings = data[:-2]
+    assert len(bookings) == 2  # zwei Buchungen im April
+    # Personennächte-Spalte folgt auf Personen, Ermittelte Einnahme folgt darauf
+    personen_index = header.index("Personen")
     pn_index = header.index("Personennächte")
-    person_nights = sorted(int(row[pn_index]) for row in data)
+    rev_index = header.index("Ermittelte Einnahme")
+    assert pn_index == personen_index + 1
+    assert rev_index == pn_index + 1
+    person_nights = sorted(int(row[pn_index]) for row in bookings)
     assert person_nights == [10, 15]
+    assert int(data[-2][pn_index]) == 25
+    assert data[-2][rev_index] == abrechnung._csv_money(440.50 + 200.0)
+    assert data[-1][pn_index] == ""
+    assert data[-1][rev_index] == abrechnung._csv_money((440.50 + 200.0) * 0.05)
+    # Geldbeträge im CSV mit Dezimalkomma, Trenner bleibt Semikolon
+    price_index = header.index("Gesamtpreis")
+    assert "," in bookings[0][price_index]
+    assert "." not in bookings[0][price_index]
 
 
 # ---------------------------------------------------------------------- #
@@ -425,3 +518,45 @@ def test_nights_und_parse_date_hilfsfunktionen():
     assert abrechnung._parse_date("2026-04-30") == date(2026, 4, 30)
     assert abrechnung._parse_date("2026-04-30T10:00:00Z") == date(2026, 4, 30)
     assert abrechnung._parse_date(None) is None
+
+
+def test_beherbergungsteuer_pdf_fuellt_relevante_felder():
+    from pypdf import PdfReader
+
+    rows = make_billing().build(2026, 4)
+    path = "/tmp/test_beherbergungsteuer.pdf"
+    abrechnung.write_beherbergungsteuer_pdf(
+        rows, 2026, 4, path, filing_date=date(2026, 8, 18)
+    )
+    fields = PdfReader(path).get_fields()
+    revenue = 440.50 + 200.0
+    assert fields["2"].get("/V") == "2026"
+    assert fields["PK"].get("/V") == "06200376"
+    assert str(fields["1"].get("/V")) == "/0"  # Anmeldung
+    assert str(fields["6"].get("/V")) == "/Ja"  # April
+    assert str(fields["9"].get("/V")) == "/Off"  # Juli aus der Vorlage abgewählt
+    page = PdfReader(path).pages[0]
+    anmeldung_as = None
+    korrektur_as = None
+    for annot in page["/Annots"]:
+        obj = annot.get_object()
+        parent = obj.get("/Parent")
+        if parent is None or str(parent.get("/T") or "") != "1":
+            continue
+        appearance = (obj.get("/AP") or {}).get("/N")
+        keys = [str(k) for k in appearance.keys()] if appearance is not None and hasattr(appearance, "keys") else []
+        if "/0" in keys:
+            anmeldung_as = str(obj.get("/AS"))
+        elif "/1" in keys:
+            korrektur_as = str(obj.get("/AS"))
+    assert anmeldung_as == "/0"
+    assert korrektur_as == "/Off"
+    assert fields["B_9"].get("/V") == "25"
+    assert fields["B_10"].get("/V") == abrechnung._csv_money(revenue)
+    assert fields["B_11"].get("/V") in ("", None)
+    assert fields["B_12"].get("/V") == abrechnung._csv_money(revenue)
+    assert fields["B_13"].get("/V") == abrechnung._csv_money(revenue * 0.05)
+    assert fields["B_14"].get("/V") == abrechnung._csv_money(revenue * 0.05)
+    assert fields["Datum"].get("/V") == "18.8.2026"
+    assert fields["B_1"].get("/V") == "Junghans"
+    assert fields["B_4"].get("/V") == "09126 Chemnitz"

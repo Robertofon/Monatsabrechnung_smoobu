@@ -54,6 +54,15 @@ except Exception:  # pragma: no cover
         return False
 
 
+try:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import NameObject
+except Exception:  # pragma: no cover
+    PdfReader = None  # type: ignore[misc, assignment]
+    PdfWriter = None  # type: ignore[misc, assignment]
+    NameObject = None  # type: ignore[misc, assignment]
+
+
 BASE_URL = "https://login.smoobu.com"
 
 # Belegung des Zahlungsstatus laut Smoobu-Doku: 0 = offen/unbezahlt, 1 = bezahlt.
@@ -282,7 +291,14 @@ class SmoobuClient:
             data = self.request(
                 "GET",
                 "/api/reservations",
-                params={"from": from_date, "to": to_date, "page": page, "pageSize": requested_page_size},
+                params={
+                    "from": from_date,
+                    "to": to_date,
+                    "page": page,
+                    "pageSize": requested_page_size,
+                    "includePriceElements": "true",
+                    "excludeBlocked": "true",
+                },
             )
             body = data.get("body", data) if isinstance(data, dict) else data
             bookings = []
@@ -353,24 +369,35 @@ class SmoobuClient:
         return body if isinstance(body, dict) else {}
 
     def get_price_elements(self, booking_id: int) -> list[dict[str, Any]]:
-        """Preiselemente (Basispreis, Reinigung, Steuer, Payment-Charge ...) einer Buchung."""
-        try:
-            data = self.request("GET", f"/api/booking/{booking_id}/price-elements")
-        except SmoobuError as err:
-            # 404 ist hier ein erwarteter Fall: nicht jede Buchung hat
-            # Preiselemente (z. B. Direktbuchungen, Stornos). Steuer/Charge/Provision
-            # bleiben dann 0. _handle hat dies bereits auf INFO gestuft.
-            if err.status_code == 404:
-                return []
-            raise
-        body = data.get("body", data) if isinstance(data, dict) else data
-        if isinstance(body, dict):
-            elements = body.get("priceElements") or body.get("data") or body.get("elements") or []
-        elif isinstance(body, list):
-            elements = body
-        else:
-            elements = []
-        return [e for e in elements if isinstance(e, dict)]
+        """Preiselemente (Basispreis, Reinigung, Steuer, Payment-Charge ...) einer Buchung.
+
+        Die Smoobu-Doku nennt ``/api/reservations/{id}/price-elements``; ältere
+        Integrationen nutzen ``/api/booking/{id}/price-elements``. Beide Pfade
+        werden versucht; 404 ist ein erwarteter Fall.
+        """
+        last_404: SmoobuError | None = None
+        for path in (
+            f"/api/reservations/{booking_id}/price-elements",
+            f"/api/booking/{booking_id}/price-elements",
+        ):
+            try:
+                data = self.request("GET", path)
+            except SmoobuError as err:
+                if err.status_code == 404:
+                    last_404 = err
+                    continue
+                raise
+            body = data.get("body", data) if isinstance(data, dict) else data
+            if isinstance(body, dict):
+                elements = body.get("priceElements") or body.get("data") or body.get("elements") or []
+            elif isinstance(body, list):
+                elements = body
+            else:
+                elements = []
+            return [e for e in elements if isinstance(e, dict)]
+        if last_404 is not None:
+            return []
+        return []
 
 
 @dataclass
@@ -455,6 +482,20 @@ def _channel_name(channel_id: Any) -> str:
     return _CHANNEL_NAMES.get(cid, "")
 
 
+def _channel_payout_amount(channel: str, price: float, commission: float) -> float | None:
+    """Numerischer Auszahlungsbetrag je Kanal, oder None wenn unbekannt.
+
+    Booking.com: Preis - (Preis * 1,4 % + Provision * 1,19)
+    Airbnb / Direct booking / Website: Preis - Provision * 1,19
+    """
+    name = (channel or "").lower()
+    if "airbnb" in name or "direct" in name or "website" in name:
+        return price - commission * 1.19
+    if "booking" in name:
+        return price - (price * 0.014 + commission * 1.19)
+    return None
+
+
 def _channel_payout(channel: str, price: float, commission: float) -> str:
     """Auszahlungsbetrag je nach Buchungskanal.
 
@@ -468,15 +509,41 @@ def _channel_payout(channel: str, price: float, commission: float) -> str:
     Die Zuordnung erfolgt groß-/kleinschreibungsunabhängig anhand des
     Channel-Namens (z. B. ``channelName`` der Reservierung).
     """
-    name = (channel or "").lower()
-    # Direct booking und Website werden (versuchsweise) wie Airbnb behandelt.
-    if "airbnb" in name or "direct" in name or "website" in name:
-        amount = price - commission * 1.19
-        return f"{amount:.2f}"
-    if "booking" in name:
-        amount = price - (price * 0.014 + commission * 1.19)
-        return f"{amount:.2f}"
-    return "Unklar"
+    amount = _channel_payout_amount(channel, price, commission)
+    if amount is None:
+        return "Unklar"
+    return f"{amount:.2f}"
+
+
+def _net_revenue(
+    channel: str,
+    price: float,
+    commission: float,
+    tax: float,
+    payment_charge: float,
+) -> float:
+    """Ermittelte Einnahme: kanalspezifische Formel, sonst Preis minus Gebühren."""
+    amount = _channel_payout_amount(channel, price, commission)
+    if amount is not None:
+        return round(amount, 2)
+    return round(price - tax - payment_charge - commission, 2)
+
+
+def _persons(reservation: dict[str, Any]) -> int:
+    """Personen = Erwachsene + Kinder; Fallback auf ``guests``."""
+    adults = _as_int(reservation.get("adults")) if "adults" in reservation else None
+    children = None
+    for key in ("children", "kids", "childs"):
+        if key in reservation and reservation.get(key) is not None:
+            children = _as_int(reservation.get(key))
+            break
+    if adults is not None or children is not None:
+        return (adults or 0) + (children or 0)
+    for key in ("guests", "guestCount", "numberOfGuests", "guest-count"):
+        count = _as_int(reservation.get(key))
+        if count:
+            return count
+    return 0
 
 
 def _month_range(year: int, month: int) -> tuple[str, str, date, date]:
@@ -517,8 +584,8 @@ class BillingRow:
     channel_payout: str  # Auszahlungsbetrag je nach Channel (Formel) oder "Unklar"
     paid_amount: float  # bezahlter Betrag
     transferred_amount: float  # überwiesener Betrag
+    net_revenue: float  # Ermittelte Einnahme (kanalspezifische Formel)
     currency: str
-    price_status: int
 
     def as_csv_row(self) -> list[Any]:
         return [
@@ -531,16 +598,16 @@ class BillingRow:
             self.nights,
             self.persons,
             self.person_nights,
-            f"{self.total_price:.2f}",
-            f"{self.tax:.2f}",
-            f"{self.payment_charge:.2f}",
-            f"{self.commission:.2f}",
+            _csv_money(self.net_revenue),
+            _csv_money(self.total_price),
+            _csv_money(self.tax),
+            _csv_money(self.payment_charge),
+            _csv_money(self.commission),
             self.channel,
-            self.channel_payout,
-            f"{self.paid_amount:.2f}",
-            f"{self.transferred_amount:.2f}",
+            _csv_money_or_text(self.channel_payout),
+            _csv_money(self.paid_amount),
+            _csv_money(self.transferred_amount),
             self.currency,
-            self.price_status,
         ]
 
 
@@ -554,6 +621,7 @@ CSV_HEADERS = [
     "Nächte",
     "Personen",
     "Personennächte",
+    "Ermittelte Einnahme",
     "Gesamtpreis",
     "Steuer",
     "Payment-Charge",
@@ -563,7 +631,6 @@ CSV_HEADERS = [
     "Bezahlter Betrag",
     "Überwiesener Betrag",
     "Währung",
-    "Preisstatus",
 ]
 
 
@@ -605,10 +672,9 @@ class MonthlyBilling:
             # Nur aktive Buchungen beruecksichtigen. Smoobu liefert 'status'
             # (z. B. 'booked', 'cancelled'). Stornierungen werden verworfen.
             # Fehlt das Feld, wird die Buchung dennoch beruecksichtigt.
-            status = res.get("status")
-            if status is not None and str(status).lower() != "booked":
+            if not _was_carried_out(res):
                 skipped_status += 1
-                continue  # keine Stornos/anderen Status
+                continue  # keine Stornos, Sperren oder sonstigen Nicht-Aufenthalte
 
             departure = _parse_date(res.get("departureDate") or res.get("departure"))
             if departure is None or not (first <= departure <= last):
@@ -617,23 +683,18 @@ class MonthlyBilling:
 
             arrival = _parse_date(res.get("arrivalDate") or res.get("arrival")) or departure
             nights = _nights(arrival, departure)
-
-            adults = _as_int(res.get("adults")) or 0
-            children = _as_int(res.get("children")) or 0
-            guests = _as_int(res.get("guests"))  # Fallback, falls adults/children fehlen
-            persons = (adults + children) or guests or 0
+            persons = _persons(res)
             person_nights = persons * nights
 
-            apartment_id = _as_int(res.get("apartmentId") or res.get("apartment_id")) or 0
-            apartment_name = res.get("apartmentName") or apartments.get(apartment_id)
-            guest_name = res.get("guestName") or _full_name(res) or ""
+            apartment_id, apartment_name = _apartment_fields(res, apartments)
+            guest_name = _guest_name(res)
 
             # Smoobu liefert in der Listen-Antwort (/api/reservations) haeufig nur
             # gekuerzte Daten: apartmentName, guestName und teils apartmentId fehlen.
             # In diesem Fall rufen wir die Einzelbuchung (/api/reservations/{id}) ab
             # und ergaenzen die fehlenden Felder daraus.
             bid = _as_int(res.get("id")) or 0
-            if (not apartment_name or not guest_name or not apartment_id) and bid:
+            if (not apartment_name or not guest_name or not apartment_id or not persons) and bid:
                 log.info(
                     "build: Buchung %s: Liste liefert apartmentId=%s, apartmentName=%r, "
                     "guestName=%r -> lade Buchungsdetails.",
@@ -645,19 +706,22 @@ class MonthlyBilling:
                     log.warning("build: Buchung %s: Detailabruf fehlgeschlagen: %s", bid, err)
                     detail = {}
                 if isinstance(detail, dict):
+                    d_id, d_name = _apartment_fields(detail, apartments)
                     if not apartment_id:
-                        apartment_id = _as_int(detail.get("apartmentId") or detail.get("apartment_id")) or 0
+                        apartment_id = d_id
                     if not apartment_name:
-                        apartment_name = detail.get("apartmentName") or apartments.get(apartment_id)
+                        apartment_name = d_name
                     if not guest_name:
-                        guest_name = detail.get("guestName") or _full_name(detail) or ""
+                        guest_name = _guest_name(detail)
+                    if not persons:
+                        persons = _persons(detail)
+                        person_nights = persons * nights
 
             if not apartment_name:
                 apartment_name = apartments.get(apartment_id) or f"Apartment {apartment_id}"
 
             total_price = _as_number(res.get("price"))
             currency = str(res.get("priceCurrency") or res.get("currency") or res.get("currencyCode") or "EUR")
-            price_status = _as_int(res.get("priceStatus")) or 0
 
             # Bezahlter Betrag: ``prepayment`` ist die geleistete Anzahlung/Zahlung.
             paid_amount = _as_number(res.get("prepayment"))
@@ -667,13 +731,8 @@ class MonthlyBilling:
             tax, payment_charge, commission = self._price_breakdown(res, res.get("id"))
 
             # Buchungskanal ermitteln. Smoobu liefert channelId und teilweise
-            # channelName; letzteres ist verlässlicher für die Zuordnung.
-            channel = str(
-                res.get("channelName")
-                or res.get("channel")
-                or _channel_name(res.get("channelId"))
-                or "Unbekannt"
-            )
+            # channelName bzw. ein verschachteltes channel-Objekt.
+            channel = _channel_from(res)
 
             # Auszahlungsbetrag je nach Channel:
             #   Airbnb:      Preis - Provision * 1,19
@@ -688,6 +747,9 @@ class MonthlyBilling:
             if prepayment_status is not None and prepayment_status != PAID:
                 transferred_amount = 0.0
                 paid_amount = 0.0
+
+            # Ermittelte Einnahme: Booking.com = Preis - (Preis*1,4% + Provision*1,19)
+            net_revenue = _net_revenue(channel, total_price, commission, tax, payment_charge)
 
             rows.append(
                 BillingRow(
@@ -708,8 +770,8 @@ class MonthlyBilling:
                     channel_payout=channel_payout,
                     paid_amount=paid_amount,
                     transferred_amount=transferred_amount,
+                    net_revenue=net_revenue,
                     currency=currency,
-                    price_status=price_status,
                 )
             )
 
@@ -722,7 +784,7 @@ class MonthlyBilling:
         return rows
 
     # ------------------------------------------------------------------ #
-    def _price_breakdown(self, reservation: dict[str, Any], booking_id: Any) -> tuple[float, float]:
+    def _price_breakdown(self, reservation: dict[str, Any], booking_id: Any) -> tuple[float, float, float]:
         """Ermittelt Steuer und Payment-Charge aus den Preiselementen.
 
         Smoobu liefert pro Preiselement ein ``type``-Feld (z. B. ``basePrice``,
@@ -730,7 +792,7 @@ class MonthlyBilling:
         die Beträge der Typen ``tax`` und ``paymentCharge``; Provisionen
         (``commission``) werden separat zurückgegeben.
         """
-        elements = reservation.get("priceElements")
+        elements = reservation.get("priceElements") or reservation.get("price-elements")
         if isinstance(elements, list) and elements:
             price_elements = [e for e in elements if isinstance(e, dict)]
         else:
@@ -753,21 +815,260 @@ class MonthlyBilling:
         return tax, payment_charge, commission
 
 
+def _was_carried_out(reservation: dict[str, Any]) -> bool:
+    """True, wenn die Buchung als durchgeführter Aufenthalt zählt.
+
+    Stornierungen, Sperr-Buchungen und andere Status als ``booked`` werden
+    ausgefiltert. Fehlt ``status``, bleibt die Buchung (defensiv) enthalten.
+    """
+    if reservation.get("is-blocked-booking") is True or reservation.get("isBlockedBooking") is True:
+        return False
+    booking_type = str(reservation.get("type") or "").lower()
+    if booking_type in {"cancellation", "cancelled", "canceled"}:
+        return False
+    status = reservation.get("status")
+    if status is not None and str(status).lower() != "booked":
+        return False
+    return True
+
+
+def _apartment_fields(reservation: dict[str, Any], apartments: dict[int, str]) -> tuple[int, str]:
+    apt = reservation.get("apartment")
+    apt_id = _as_int(
+        reservation.get("apartmentId")
+        or reservation.get("apartment_id")
+        or (apt.get("id") if isinstance(apt, dict) else None)
+    ) or 0
+    apt_name = (
+        reservation.get("apartmentName")
+        or (apt.get("name") if isinstance(apt, dict) else None)
+        or apartments.get(apt_id)
+        or ""
+    )
+    return apt_id, str(apt_name) if apt_name else ""
+
+
+def _guest_name(reservation: dict[str, Any]) -> str:
+    name = reservation.get("guestName") or reservation.get("guest-name") or _full_name(reservation)
+    return str(name).strip() if name else ""
+
+
+def _channel_from(reservation: dict[str, Any]) -> str:
+    channel = reservation.get("channel")
+    name = reservation.get("channelName")
+    channel_id = reservation.get("channelId")
+    if isinstance(channel, dict):
+        name = name or channel.get("name")
+        channel_id = channel_id or channel.get("id")
+    elif isinstance(channel, str) and not name:
+        name = channel
+    return str(name or _channel_name(channel_id) or "Unbekannt")
+
+
 def _full_name(reservation: dict[str, Any]) -> str:
-    first = reservation.get("firstName") or ""
-    last = reservation.get("lastName") or ""
+    first = reservation.get("firstName") or reservation.get("firstname") or ""
+    last = reservation.get("lastName") or reservation.get("lastname") or ""
     return f"{first} {last}".strip()
 
 
 # ---------------------------------------------------------------------- #
 # CSV-Export
 # ---------------------------------------------------------------------- #
+def _csv_money(value: float) -> str:
+    """CSV-Geldbetrag mit Dezimalkomma, Trenner bleibt Semikolon."""
+    return f"{value:.2f}".replace(".", ",")
+
+
+def _csv_money_or_text(value: str) -> str:
+    if not value or value == "Unklar":
+        return value
+    return value.replace(".", ",")
+
+
 def write_csv(rows: Iterable[BillingRow], output_path: str) -> None:
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    rows = list(rows)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh, delimiter=";")
         writer.writerow(CSV_HEADERS)
         for row in rows:
             writer.writerow(row.as_csv_row())
+        for extra in _csv_footer_rows(rows):
+            writer.writerow(extra)
+
+
+def _csv_footer_rows(rows: list[BillingRow]) -> list[list[Any]]:
+    """Komfortzeilen: Summe (Personennächte + Ermittelte Einnahme) und Steuer 5 %."""
+    person_nights = sum(row.person_nights for row in rows)
+    revenue = sum(row.net_revenue for row in rows)
+    pn_index = CSV_HEADERS.index("Personennächte")
+    revenue_index = CSV_HEADERS.index("Ermittelte Einnahme")
+    departure_index = CSV_HEADERS.index("Abreise")
+
+    sum_row = [""] * len(CSV_HEADERS)
+    sum_row[departure_index] = "Summe"
+    sum_row[pn_index] = person_nights
+    sum_row[revenue_index] = _csv_money(revenue)
+
+    tax_row = [""] * len(CSV_HEADERS)
+    tax_row[departure_index] = "Steuer 5%"
+    tax_row[revenue_index] = _csv_money(revenue * 0.05)
+    return [sum_row, tax_row]
+
+
+# ---------------------------------------------------------------------- #
+# Beherbergungsteuer-PDF (Stadt Chemnitz)
+# ---------------------------------------------------------------------- #
+_MONTH_CHECKBOX = {m: str(m + 2) for m in range(1, 13)}  # Jan="3" … Dez="14"
+
+
+def default_beherbergung_template() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "beherbergungsteuer.pdf")
+
+
+def default_betreiber_json() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "betreiber.json")
+
+
+def load_betreiber(path: str | None = None) -> dict[str, Any]:
+    path = path or os.getenv("BEHERBERGUNG_BETREIBER") or default_betreiber_json()
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Betreiber-JSON muss ein Objekt sein: {path}")
+    return data
+
+
+def _german_date(value: date) -> str:
+    return f"{value.day}.{value.month}.{value.year}"
+
+
+def write_beherbergungsteuer_pdf(
+    rows: Iterable[BillingRow],
+    year: int,
+    month: int,
+    output_path: str,
+    *,
+    filing_date: date | None = None,
+    template_path: str | None = None,
+    betreiber_path: str | None = None,
+) -> str:
+    """Füllt die amtliche Anmeldung und schreibt sie nach ``output_path``."""
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pypdf ist nicht installiert (pip install pypdf).")
+
+    rows = list(rows)
+    template_path = template_path or os.getenv("BEHERBERGUNG_TEMPLATE") or default_beherbergung_template()
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"Beherbergungsteuer-Vorlage nicht gefunden: {template_path}")
+    betreiber = load_betreiber(betreiber_path)
+
+    person_nights = sum(row.person_nights for row in rows)
+    revenue = sum(row.net_revenue for row in rows)
+    tax = revenue * 0.05
+    filing_date = filing_date or date.today()
+
+    reader = PdfReader(template_path)
+    writer = PdfWriter()
+    writer.append(reader)
+    page = writer.pages[0]
+
+    writer.update_page_form_field_values(
+        page,
+        {
+            "PK": str(betreiber.get("personenkonto") or ""),
+            "2": str(year),
+            "B_1": str(betreiber.get("name") or ""),
+            "B_2": str(betreiber.get("vorname") or ""),
+            "B_3": str(betreiber.get("strasse") or ""),
+            "B_4": str(betreiber.get("plz_ort") or ""),
+            "B_5": str(betreiber.get("telefon_email") or ""),
+            "B_6": str(betreiber.get("einrichtung") or ""),
+            "B_7": str(betreiber.get("einrichtung_strasse") or ""),
+            "B_8": str(betreiber.get("einrichtung_plz_ort") or ""),
+            "B_9": str(person_nights),
+            "B_10": _csv_money(revenue),
+            "B_11": "",
+            "B_12": _csv_money(revenue),
+            "B_13": _csv_money(tax),
+            "B_14": _csv_money(tax),
+            "Datum": _german_date(filing_date),
+        },
+        auto_regenerate=False,
+    )
+    _set_anmeldung_checkbox(page)
+    _set_month_checkboxes(page, month)
+
+    writer.set_need_appearances_writer(True)
+
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(output_path, "wb") as handle:
+        writer.write(handle)
+    return output_path
+
+
+def _set_month_checkboxes(page, month: int) -> None:
+    """Hakt nur den Zielmonat an. Fehlende /Ja-Optik wird von Juli übernommen."""
+    widgets: dict[str, Any] = {}
+    for annot in page.get("/Annots") or []:
+        obj = annot.get_object()
+        name = obj.get("/T")
+        if name:
+            widgets[str(name)] = obj
+
+    donor = None
+    for candidate in ("9", "3", "10", "12"):
+        widget = widgets.get(candidate)
+        if widget is None:
+            continue
+        appearance = (widget.get("/AP") or {}).get("/N")
+        if appearance is not None and hasattr(appearance, "get") and appearance.get("/Ja"):
+            donor = widget
+            break
+
+    target = _MONTH_CHECKBOX[month]
+    for number in range(1, 13):
+        name = _MONTH_CHECKBOX[number]
+        widget = widgets.get(name)
+        if widget is None:
+            continue
+        if name == target and donor is not None:
+            widget[NameObject("/AP")] = donor.get("/AP")
+            widget[NameObject("/V")] = NameObject("/Ja")
+            widget[NameObject("/AS")] = NameObject("/Ja")
+        else:
+            widget[NameObject("/V")] = NameObject("/Off")
+            widget[NameObject("/AS")] = NameObject("/Off")
+
+
+def _set_anmeldung_checkbox(page) -> None:
+    """Hakt immer die Checkbox „Anmeldung“ (Feld 1, Zustand /0) an."""
+    parent = None
+    kids: list[Any] = []
+    for annot in page.get("/Annots") or []:
+        obj = annot.get_object()
+        if str(obj.get("/T") or "") == "1":
+            parent = obj
+        linked = obj.get("/Parent")
+        if linked is not None and str(linked.get("/T") or "") == "1":
+            kids.append(obj)
+            if parent is None:
+                parent = linked.get_object() if hasattr(linked, "get_object") else linked
+    if parent is not None:
+        parent[NameObject("/V")] = NameObject("/0")
+    for kid in kids:
+        appearance = (kid.get("/AP") or {}).get("/N")
+        keys = [str(key) for key in appearance.keys()] if appearance is not None and hasattr(appearance, "keys") else []
+        if "/0" in keys:
+            kid[NameObject("/AS")] = NameObject("/0")
+            kid[NameObject("/V")] = NameObject("/0")
+        else:
+            kid[NameObject("/AS")] = NameObject("/Off")
+            kid[NameObject("/V")] = NameObject("/Off")
 
 
 def print_summary(rows: list[BillingRow], year: int, month: int) -> None:
@@ -780,6 +1081,8 @@ def print_summary(rows: list[BillingRow], year: int, month: int) -> None:
         f"  Steuer gesamt:             {sum(r.tax for r in rows):.2f}\n"
         f"  Payment-Charge gesamt:     {sum(r.payment_charge for r in rows):.2f}\n"
         f"  Provision gesamt:          {sum(r.commission for r in rows):.2f}\n"
+        f"  Ermittelte Einnahme:       {sum(r.net_revenue for r in rows):.2f}\n"
+        f"  Steuer 5%:                 {sum(r.net_revenue for r in rows) * 0.05:.2f}\n"
         f"  Bezahlter Betrag gesamt:   {sum(r.paid_amount for r in rows):.2f}\n"
         f"  Überwiesener Betrag gesamt:{sum(r.transferred_amount for r in rows):.2f}\n"
         f"  Personennächte gesamt:     {sum(r.person_nights for r in rows)}"
@@ -857,6 +1160,12 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(rows, output)
     print_summary(rows, year, month)
     print(f"\nCSV-Report geschrieben: {output}")
+    pdf_output = os.path.join(
+        os.path.dirname(output) or ".",
+        f"beherbergungsteuer_{year:04d}-{month:02d}.pdf",
+    )
+    write_beherbergungsteuer_pdf(rows, year, month, pdf_output)
+    print(f"Beherbergungsteuer-Anmeldung: {pdf_output}")
     return 0
 
 
