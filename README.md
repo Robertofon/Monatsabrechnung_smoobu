@@ -18,6 +18,7 @@ Pro Buchung werden ermittelt:
 | Nächte              | Abreise − Anreise |
 | Personen            | adults + children (Fallback: guests) |
 | **Personennächte**  | Personen × Nächte |
+| **Ermittelte Einnahme** | `Booking.com`: Preis − (Preis×1,4 % + Provision×1,19) · `Airbnb`/Direkt/Website: Preis − Provision×1,19 |
 | Gesamtpreis         | `price` der Buchung |
 | Steuer              | Summe aller Preiselemente vom Typ `tax`/`vat` |
 | Payment-Charge      | Summe aller Preiselemente vom Typ `paymentCharge` |
@@ -26,13 +27,19 @@ Pro Buchung werden ermittelt:
 | Auszahlung (Channel) | `Airbnb`: Preis − Provision×1,19 · `Booking.com`: Preis − (Preis×1,4 % + Provision×1,19) · sonst "Unklar" |
 | Bezahlter Betrag    | `prepayment` (sofern `prepaymentStatus = 1`) |
 | Überwiesener Betrag | Gesamtpreis − Steuer − Payment-Charge (nur bei bezahlten Buchungen) |
-| Währung / Preisstatus | Währung + Zahlungsstatus |
+| Währung             | Währung der Buchung |
+
+Am Ende der CSV stehen zwei Komfortzeilen in der Spalte **Abreise**: **Summe** (Personennächte und Ermittelte Einnahme) sowie **Steuer 5%** (5 % der ermittelten Einnahme). Geldbeträge verwenden Dezimalkomma, der Spaltentrenner bleibt `;`.
 
 > Hinweis: Smoobu liefert Steuern und Gebühren nicht immer als separates Feld auf
 > der Buchung. Das Programm ruft daher zusätzlich die **Preiselemente** je Buchung
-> ab (`/api/booking/{id}/price-elements`) und summiert die Typen `tax` und
-> `paymentCharge`. Sind in der Reservierung bereits `priceElements` enthalten,
-> werden diese direkt verwendet (weniger API-Aufrufe).
+> ab (`/api/reservations/{id}/price-elements`) und summiert die Typen `tax`/`vat`,
+> `paymentCharge` und `commission`. Sind in der Reservierung bereits `priceElements`
+> enthalten, werden diese direkt verwendet (weniger API-Aufrufe).
+>
+> Stornierte, geblockte und nicht durchgeführte Buchungen (`status` ungleich
+> `booked`, Typ `cancellation`, Sperr-Buchungen) werden ausgefiltert. Gastname und
+> Unterkunftsname werden immer mit ausgegeben.
 
 ## Authentifizierung
 
@@ -74,8 +81,15 @@ python abrechnung.py 2026-04 -o export/april.csv
 python abrechnung.py 2026-04 --api-key usr_live_xxx --api-secret geheim
 ```
 
-Ausgabe ist eine CSV-Datei (Standard: `abrechnung_2026-04.csv`) sowie eine
-Zusammenfassung auf der Konsole.
+Ausgabe ist eine CSV-Datei (Standard: `abrechnung_2026-04.csv`), die
+**Beherbergungsteuer-Anmeldung** der Stadt Chemnitz
+(`beherbergungsteuer_2026-04.pdf`) sowie eine Zusammenfassung auf der Konsole.
+
+Die PDF ist die amtliche Vorlage (`templates/beherbergungsteuer.pdf`), leer
+ohne Stammdaten. Betreiber, Einrichtung und Personenkonto stehen in
+`templates/betreiber.json`. Beim Ausfüllen wird immer **Anmeldung** angehakt;
+variable Felder sind Jahr, Monat, Personennächte (Zeile 9), ermittelte Einnahme
+(Zeilen 10/12), Steuer 5 % (Zeilen 13/14) und das Ausstellungsdatum.
 
 ## Tests
 
