@@ -560,3 +560,18 @@ def test_beherbergungsteuer_pdf_fuellt_relevante_felder():
     assert fields["Datum"].get("/V") == "18.8.2026"
     assert fields["B_1"].get("/V") == "Junghans"
     assert fields["B_4"].get("/V") == "09126 Chemnitz"
+
+
+def test_beherbergungsteuer_pdf_hakt_juni_an():
+    from pypdf import PdfReader
+
+    rows = make_billing().build(2026, 4)
+    path = "/tmp/test_beherbergungsteuer_juni.pdf"
+    abrechnung.write_beherbergungsteuer_pdf(
+        rows, 2026, 6, path, filing_date=date(2026, 7, 3)
+    )
+    fields = PdfReader(path).get_fields()
+    assert str(fields["1"].get("/V")) == "/0"
+    assert str(fields["8"].get("/V")) == "/Ja"  # Juni
+    assert str(fields["9"].get("/V")) == "/Off"
+    assert fields["Datum"].get("/V") == "3.7.2026"

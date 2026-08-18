@@ -63,6 +63,32 @@ except Exception:  # pragma: no cover
     NameObject = None  # type: ignore[misc, assignment]
 
 
+def _bootstrap_venv_site() -> None:
+    """Falls ``python3`` statt ``.venv/bin/python`` genutzt wird, pypdf aus der venv laden."""
+    global PdfReader, PdfWriter, NameObject
+    if PdfReader is not None:
+        return
+    lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "lib")
+    if not os.path.isdir(lib):
+        return
+    for name in os.listdir(lib):
+        site = os.path.join(lib, name, "site-packages")
+        if os.path.isdir(site) and site not in sys.path:
+            sys.path.insert(0, site)
+    try:
+        from pypdf import PdfReader as _Reader
+        from pypdf import PdfWriter as _Writer
+        from pypdf.generic import NameObject as _Name
+    except Exception:
+        return
+    PdfReader = _Reader
+    PdfWriter = _Writer
+    NameObject = _Name
+
+
+_bootstrap_venv_site()
+
+
 BASE_URL = "https://login.smoobu.com"
 
 # Belegung des Zahlungsstatus laut Smoobu-Doku: 0 = offen/unbezahlt, 1 = bezahlt.
@@ -1164,7 +1190,12 @@ def main(argv: list[str] | None = None) -> int:
         os.path.dirname(output) or ".",
         f"beherbergungsteuer_{year:04d}-{month:02d}.pdf",
     )
-    write_beherbergungsteuer_pdf(rows, year, month, pdf_output)
+    try:
+        write_beherbergungsteuer_pdf(rows, year, month, pdf_output)
+    except Exception as err:
+        print(f"Beherbergungsteuer-PDF fehlgeschlagen: {err}", file=sys.stderr)
+        print("CSV wurde trotzdem geschrieben. Für das PDF: .venv/bin/python abrechnung.py …", file=sys.stderr)
+        return 1
     print(f"Beherbergungsteuer-Anmeldung: {pdf_output}")
     return 0
 
