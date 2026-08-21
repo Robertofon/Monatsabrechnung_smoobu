@@ -1141,6 +1141,15 @@ def _parse_month(value: str) -> tuple[int, int]:
     return year, month
 
 
+def _output_paths(year: int, month: int, directory: str | None) -> tuple[str, str]:
+    """CSV- und PDF-Pfad im Zielverzeichnis (Standard: aktuelles Verzeichnis)."""
+    base = directory or "."
+    stamp = f"{year:04d}-{month:02d}"
+    csv_path = os.path.join(base, f"Buchungsliste_{stamp}.csv")
+    pdf_path = os.path.join(base, f"Beherbergungssteuer_{stamp}.pdf")
+    return csv_path, pdf_path
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
@@ -1148,10 +1157,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("monat", help='Monat, z. B. "2026-04", "04.2026" oder "202604"')
     parser.add_argument(
-        "-o",
-        "--output",
+        "-p",
+        "--path",
         default=None,
-        help="Pfad zur CSV-Ausgabedatei (Standard: abrechnung_YYYY-MM.csv).",
+        help="Verzeichnis für CSV und PDF (Standard: aktuelles Verzeichnis).",
     )
     parser.add_argument(
         "--api-key",
@@ -1166,7 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     year, month = _parse_month(args.monat)
-    output = args.output or f"abrechnung_{year:04d}-{month:02d}.csv"
+    output, pdf_output = _output_paths(year, month, args.path)
 
     config = SmoobuConfig()
     if args.api_key:
@@ -1186,10 +1195,6 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(rows, output)
     print_summary(rows, year, month)
     print(f"\nCSV-Report geschrieben: {output}")
-    pdf_output = os.path.join(
-        os.path.dirname(output) or ".",
-        f"beherbergungsteuer_{year:04d}-{month:02d}.pdf",
-    )
     try:
         write_beherbergungsteuer_pdf(rows, year, month, pdf_output)
     except Exception as err:

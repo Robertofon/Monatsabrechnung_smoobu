@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 abrechnung_*.csv
+Buchungsliste_*.csv
 beherbergungsteuer_*.pdf
+Beherbergungssteuer_*.pdf
 .venv/
 venv/

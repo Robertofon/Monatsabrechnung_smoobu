@@ -10,6 +10,7 @@ import csv
 import hashlib
 import hmac
 import base64
+import os
 from datetime import date
 
 import abrechnung
@@ -510,6 +511,16 @@ def test_monatsparser_ungültig():
         except argparse.ArgumentTypeError:
             continue
         raise AssertionError(f"Ungültiger Monat '{bad}' wurde akzeptiert")
+
+
+def test_output_paths_standard_und_zielverzeichnis():
+    csv_path, pdf_path = abrechnung._output_paths(2026, 4, None)
+    assert csv_path == os.path.join(".", "Buchungsliste_2026-04.csv")
+    assert pdf_path == os.path.join(".", "Beherbergungssteuer_2026-04.pdf")
+
+    csv_path, pdf_path = abrechnung._output_paths(2026, 11, "/tmp/export")
+    assert csv_path == os.path.join("/tmp/export", "Buchungsliste_2026-11.csv")
+    assert pdf_path == os.path.join("/tmp/export", "Beherbergungssteuer_2026-11.pdf")
 
 
 def test_nights_und_parse_date_hilfsfunktionen():
