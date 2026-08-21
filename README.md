@@ -77,13 +77,14 @@ Alternative Formate für den Monat:
 ```bash
 python abrechnung.py 04.2026
 python abrechnung.py 202604
-python abrechnung.py 2026-04 -o export/april.csv
+python abrechnung.py 2026-04 -p export/
 python abrechnung.py 2026-04 --api-key usr_live_xxx --api-secret geheim
 ```
 
-Ausgabe ist eine CSV-Datei (Standard: `abrechnung_2026-04.csv`), die
+Ausgabe ist eine CSV-Datei (Standard: `Buchungsliste_2026-04.csv`), die
 **Beherbergungsteuer-Anmeldung** der Stadt Chemnitz
-(`beherbergungsteuer_2026-04.pdf`) sowie eine Zusammenfassung auf der Konsole.
+(`Beherbergungssteuer_2026-04.pdf`) sowie eine Zusammenfassung auf der Konsole.
+Mit `-p`/`--path` landen beide Dateien im angegebenen Verzeichnis.
 
 Die PDF ist die amtliche Vorlage (`templates/beherbergungsteuer.pdf`), leer
 ohne Stammdaten. Betreiber, Einrichtung und Personenkonto stehen in
